@@ -478,4 +478,306 @@ void SurfaceSubdivision::quad_tri()
     mesh_.remove_vertex_property(new_pos);
 }
 
+void SurfaceSubdivision::quad_tri_interpolating(int n_steps, int n_iterations)
+{
+    auto vsharp_edges_ = mesh_.vertex_property<int>("v:sharp_edges", 0);
+    auto esharpness_ = mesh_.edge_property<Scalar>("e:sharpness", -1.0);
+
+    size_t nv = mesh_.n_vertices();
+
+    // define interpolating points
+    Eigen::MatrixX3d ipoints, cpoints;
+    ipoints.resize(nv, Eigen::NoChange);
+    int row_idx = 0;
+    for (Vertex v : mesh_.vertices())
+    {
+        ipoints.row(row_idx) = static_cast<Eigen::Vector3d>(points_[v]);
+        ++row_idx;
+    }
+    cpoints = ipoints;
+
+    // subdivision matrix
+    Eigen::SparseMatrix<double> W(nv, nv);
+    W.setIdentity();
+
+    Eigen::SparseMatrix<double> P, V;
+    std::vector<Eigen::Triplet<double>> P_trip, V_trip;
+    for (int i = 0; i < n_steps; ++i)
+    {
+        P_trip.clear();
+        V_trip.clear();
+
+        const size_t n_initial_vertices = mesh_.n_vertices();
+
+        auto vidx = mesh_.add_vertex_property<IndexType>("quad_tri:vidx");
+        int idx = 0;
+
+        // vertex point weights for linear subdivision matrix
+        for (Vertex v : mesh_.vertices())
+        {
+            P_trip.emplace_back(idx, idx, 1.0);
+            vidx[v] = idx++;
+        }
+
+        // edge point weights for linear subdivsion matrix
+        for (Edge e : mesh_.edges())
+        {
+            P_trip.emplace_back(idx, vidx[mesh_.vertex(e, 0)], 0.5);
+            P_trip.emplace_back(idx, vidx[mesh_.vertex(e, 1)], 0.5);
+            ++idx;
+        }
+
+        // face point weights for linear subdivision matrix
+        for (Face f : mesh_.faces())
+        {
+            size_t fval = mesh_.valence(f);
+            if (fval >= 4)
+            {
+                for (Vertex v : mesh_.vertices(f))
+                {
+                    P_trip.emplace_back(idx, vidx[v], 1.0 / fval);
+                }
+                ++idx;
+            }
+        }
+
+        idx = n_initial_vertices;
+
+        // split edges linearly
+        for (auto e : mesh_.edges())
+        {
+            // for linear subdivision
+            auto epoint =
+                0.5 * (points_[mesh_.vertex(e, 0)] + points_[mesh_.vertex(e, 1)]);
+            Halfedge h = mesh_.insert_vertex(e, epoint);
+
+            vidx[mesh_.to_vertex(h)] = idx++;
+
+            vsharp_edges_[mesh_.to_vertex(h)] = 2;
+            esharpness_[mesh_.edge(h)] = esharpness_[e];
+            esharpness_[mesh_.edge(mesh_.next_halfedge(h))] = esharpness_[e];
+        }
+
+
+        // split faces linearly
+        for (Face f : mesh_.faces())
+        {
+            size_t fVal = mesh_.valence(f) / 2; // initial valence of face
+            if (fVal == 3)
+            {
+                auto h = mesh_.halfedge(f);
+                mesh_.insert_edge(h, mesh_.next_halfedge(mesh_.next_halfedge(h)));
+                h = mesh_.next_halfedge(h);
+                mesh_.insert_edge(h, mesh_.next_halfedge(mesh_.next_halfedge(h)));
+                h = mesh_.next_halfedge(h);
+                mesh_.insert_edge(h, mesh_.next_halfedge(mesh_.next_halfedge(h)));
+            }
+            else if (fVal >= 4)
+            {
+                auto fpoint = centroid(mesh_, f);
+
+                auto h0 = mesh_.halfedge(f);
+                mesh_.insert_edge(h0, mesh_.next_halfedge(mesh_.next_halfedge(h0)));
+
+                auto h1 = mesh_.next_halfedge(h0);
+                mesh_.insert_vertex(mesh_.edge(h1), fpoint);
+
+                vidx[mesh_.to_vertex(h1)] = idx++;
+
+                auto h = mesh_.next_halfedge(
+                    mesh_.next_halfedge(mesh_.next_halfedge(h1)));
+                while (h != h0)
+                {
+                    mesh_.insert_edge(h1, h);
+                    h = mesh_.next_halfedge(
+                        mesh_.next_halfedge(mesh_.next_halfedge(h1)));
+                }
+            }
+        }
+
+        // compute smoothing mask for linearly subdivided mesh
+        for (Vertex v : mesh_.vertices())
+        {
+            // isolated vertex
+            if (mesh_.is_isolated(v))
+            {
+                V_trip.emplace_back(vidx[v], vidx[v], 1.0);
+            }
+
+            // boundary vertex
+            else if (mesh_.is_boundary(v))
+            {
+                V_trip.emplace_back(vidx[v], vidx[v], 0.5);
+                for (Vertex vv : mesh_.vertices(v))
+                {
+                    if (mesh_.is_boundary(vv))
+                    {
+                        V_trip.emplace_back(vidx[v], vidx[vv], 0.25);
+                    }
+                }
+            }
+
+            // corner vertex
+            else if (vsharp_edges_[v] > 2)
+            {
+                V_trip.emplace_back(vidx[v], vidx[v], 1.0);
+            }
+            // smooth / sharp / semi-sharp vertex
+            else
+            {
+                std::vector<Eigen::Triplet<double>> smooth_weights, sharp_weights;
+                float vsharpness = 0.0f;
+
+                // compute weights for sharp vertex
+                if (vsharp_edges_[v] == 2)
+                {
+                    sharp_weights.emplace_back(vidx[v], vidx[v], 0.5);
+
+                    for (auto h : mesh_.halfedges(v))
+                    {
+                        if (esharpness_[mesh_.edge(h)] > 0.0f)
+                        {
+                            sharp_weights.emplace_back(
+                                vidx[v], vidx[mesh_.to_vertex(h)], 0.25);
+                            vsharpness += esharpness_[mesh_.edge(h)];
+                        }
+                    }
+
+                    vsharpness *= 0.5f;
+                }
+
+                // crease vertex
+                if (vsharpness >= 1.0f)
+                {
+                    V_trip.insert(V_trip.end(), sharp_weights.begin(),
+                                  sharp_weights.end());
+                }
+                // compute weights for smooth vertex
+                else
+                {
+                    int n_edges = 0, n_quads = 0;
+                    for (Face f : mesh_.faces(v))
+                    {
+                        n_edges++;
+                        n_quads += mesh_.valence(f) == 4;
+                    }
+
+                    // surrounded by triangles
+                    if (n_quads == 0)
+                    {
+                        double a =
+                            2.0 * pow(3.0 / 8.0 +
+                                          (std::cos(2.0 * M_PI / n_edges)) / 4.0,
+                                      2.0) -
+                            0.25;
+                        double b = (1.0 - a) / n_edges;
+
+                        smooth_weights.emplace_back(vidx[v], vidx[v], a);
+                        for (Vertex vv : mesh_.vertices(v))
+                        {
+                            smooth_weights.emplace_back(vidx[v], vidx[vv], b);
+                        }
+                    }
+                    // surrounded by quads
+                    else if (n_quads == n_edges)
+                    {
+                        double c = (n_edges - 3.0) / n_edges;
+                        double d = 2.0 / pow(n_edges, 2.0);
+                        double e = 1.0 / pow(n_edges, 2.0);
+
+                        smooth_weights.emplace_back(vidx[v], vidx[v], c);
+                        for (Halfedge h : mesh_.halfedges(v))
+                        {
+                            smooth_weights.emplace_back(
+                                vidx[v], vidx[mesh_.to_vertex(h)], d);
+                            smooth_weights.emplace_back(
+                                vidx[v],
+                                vidx[mesh_.to_vertex(mesh_.next_halfedge(h))], e);
+                        }
+                    }
+                    // surrounded by triangles and quads
+                    else
+                    {
+                        double alpha = 1.0 / (1.0 + n_edges / 2.0 + n_quads / 4.0);
+                        double beta = alpha / 2.0;
+                        double gamma = alpha / 4.0;
+
+                        smooth_weights.emplace_back(vidx[v], vidx[v], alpha);
+                        for (Halfedge h : mesh_.halfedges(v))
+                        {
+                            smooth_weights.emplace_back(
+                                vidx[v], vidx[mesh_.to_vertex(h)], beta);
+                            if (mesh_.valence(mesh_.face(h)) == 4)
+                            {
+                                smooth_weights.emplace_back(
+                                    vidx[v],
+                                    vidx[mesh_.to_vertex(mesh_.next_halfedge(h))],
+                                    gamma);
+                            }
+                        }
+                    }
+
+                    // semi-sharp vertex
+                    if (vsharpness > 0.0f)
+                    {
+                        for (auto t : sharp_weights)
+                            V_trip.emplace_back(t.row(), t.col(),
+                                                t.value() * vsharpness);
+                        for (auto t : smooth_weights)
+                            V_trip.emplace_back(t.row(), t.col(),
+                                                t.value() * (1.0 - vsharpness));
+                    }
+                    // smooth vertex
+                    else
+                    {
+                        V_trip.insert(V_trip.end(), smooth_weights.begin(),
+                                      smooth_weights.end());
+                    }
+                }
+            }
+        }
+
+        // update edge sharpness
+        for (Edge e : mesh_.edges())
+        {
+            if (esharpness_[e] > 0.0)
+            {
+                esharpness_[e] = std::max(esharpness_[e] - 1.0, 0.0);
+                if (esharpness_[e] <= 0.0)
+                {
+                    vsharp_edges_[mesh_.vertex(e, 0)] -= 1;
+                    vsharp_edges_[mesh_.vertex(e, 1)] -= 1;
+                }
+            }
+        }
+
+        mesh_.remove_vertex_property(vidx);
+
+        P.resize(mesh_.n_vertices(), n_initial_vertices);
+        P.setFromTriplets(P_trip.begin(), P_trip.end());
+
+        V.resize(mesh_.n_vertices(), mesh_.n_vertices());
+        V.setFromTriplets(V_trip.begin(), V_trip.end());
+
+        W = V * P * W;
+    }
+
+    // update positions for initial vertices
+    for (int k = 0; k < n_iterations; ++k)
+    {
+        cpoints += ipoints - (W * cpoints).topRows(nv);
+    }
+
+    std::cout << ipoints - (W * cpoints).topRows(nv) << std::endl;
+
+    // compute vertex positions for subdivided mesh
+    Eigen::MatrixX3d spoints = W * cpoints;
+
+    row_idx = 0;
+    for (Vertex v : mesh_.vertices())
+    {
+        points_[v] = spoints.row(row_idx);
+        ++row_idx;
+    }
+}
 } // namespace pmp

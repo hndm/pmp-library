@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <Eigen/Sparse>
+
 #include "pmp/SurfaceMesh.h"
 
 namespace pmp {
@@ -28,6 +30,10 @@ public:
     //! \brief Perform one step of quad-tri subdivision.
     //! \details See \cite stam_2003_subdiv for details.
     void quad_tri();
+
+    //!\brief Perform one step of interpolating quad-tri subdivision.
+    //!\details Based on \cite stam_2003_subdiv and \cite chen_2008_interpolating.
+    void quad_tri_interpolating(int n_steps = 1, int n_iterations = 30);
 
 private:
     SurfaceMesh& mesh_;

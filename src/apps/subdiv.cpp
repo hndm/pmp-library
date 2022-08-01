@@ -67,9 +67,9 @@ void Viewer::process_imgui()
             update_mesh();
         }
 
-        if (ImGui::Button("Quad/Tri Subdivision"))
+        if (ImGui::Button("Quad/Tri Subdivision Interpolating"))
         {
-            SurfaceSubdivision(mesh_).quad_tri();
+            SurfaceSubdivision(mesh_).quad_tri_interpolating(4, 50);
             update_mesh();
         }
     }
